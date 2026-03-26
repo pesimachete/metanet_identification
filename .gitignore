@@ -1,0 +1,7 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local project directories
+opt/
+tests/
