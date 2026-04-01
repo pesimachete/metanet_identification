@@ -1,11 +1,17 @@
-import jax
-import jax.numpy as jnp
+import os
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-import numpy as np
+
+import jax
+import jax.numpy as jnp
+
 
 import metanet
-import persistentExitationSimulation as pes
+import simulationMetanet as pes
+
+
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 
 def compute_separated_sensitivities(
@@ -15,28 +21,24 @@ def compute_separated_sensitivities(
     baseline_traj: metanet.SimulationTrajectory,
 ):
     # Pre-compute normalization factors to keep sensitivities dimensionless
-    norm_density = jnp.mean(jnp.square(baseline_traj.density)) + 1e-6
-    norm_speed = jnp.mean(jnp.square(baseline_traj.speed)) + 1e-6
-    norm_flow = jnp.mean(jnp.square(baseline_traj.flow)) + 1e-6
 
     # Define the three isolated loss functions
     def loss_density(p: metanet.NetworkParameters):
         traj = metanet.rollout_simulation(init_state, boundaries, p)
-        return jnp.mean(jnp.square(traj.density - baseline_traj.density)) / norm_density
+        return jnp.mean(jnp.square(traj.density - baseline_traj.density))
 
     def loss_speed(p: metanet.NetworkParameters):
         traj = metanet.rollout_simulation(init_state, boundaries, p)
-        return jnp.mean(jnp.square(traj.speed - baseline_traj.speed)) / norm_speed
+        return jnp.mean(jnp.square(traj.speed - baseline_traj.speed))
 
     def loss_flow(p: metanet.NetworkParameters):
         traj = metanet.rollout_simulation(init_state, boundaries, p)
-        return jnp.mean(jnp.square(traj.flow - baseline_traj.flow)) / norm_flow
+        return jnp.mean(jnp.square(traj.flow - baseline_traj.flow))
 
-    # --- THE MAGIC FIX ---
-    # Using jacrev(jacrev(...)) instead of jacfwd(jacrev(...))
     H_rho_tree = jax.jit(jax.jacfwd(jax.jacrev(loss_density)))(p0)
     H_v_tree = jax.jit(jax.jacfwd(jax.jacrev(loss_speed)))(p0)
     H_q_tree = jax.jit(jax.jacfwd(jax.jacrev(loss_flow)))(p0)
+
     empirical_fields = [
         "tau",
         "nu",
@@ -68,13 +70,10 @@ def compute_separated_sensitivities(
 
 
 def plot_separated_importances(sensitivities, N: int):
-    """
-    Creates a 3-panel side-by-side heatmap visualization of the parameter sensitivities.
-    """
     fields = list(sensitivities["density"].keys())
     states = ["density", "speed", "flow"]
     titles = ["Density Sensitivity", "Speed Sensitivity", "Flow Sensitivity"]
-    cmaps = ["Reds", "gist_heat", "Blues"]  # Match your trajectory plot colors!
+    cmaps = ["Reds", "Greens", "Blues"]  # Match your trajectory plot colors!
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
 
@@ -94,24 +93,6 @@ def plot_separated_importances(sensitivities, N: int):
         ax.set_xlabel("Network Section Index (i)", fontsize=12, fontweight="bold")
         ax.set_title(titles[idx], fontsize=14)
 
-        # Annotate high-impact values (optional, keeps it readable)
-        max_val = np.max(data_matrix)
-        for i in range(len(fields)):
-            for j in range(N):
-                val = data_matrix[i, j]
-                if val > max_val * 1e-3:
-                    # White text for dark backgrounds, black for light
-                    color = "w" if val > max_val * 0.1 else "black"
-                    ax.text(
-                        j,
-                        i,
-                        f"{val:.1e}",
-                        ha="center",
-                        va="center",
-                        color=color,
-                        fontsize=8,
-                    )
-
         # Add a colorbar for each subplot
         cbar = fig.colorbar(cax, ax=ax, fraction=0.046, pad=0.04)
         if idx == 2:
@@ -123,7 +104,7 @@ def plot_separated_importances(sensitivities, N: int):
     axes[0].set_ylabel("Empirical Parameter", fontsize=12, fontweight="bold")
 
     fig.suptitle(
-        "Parameter Sensitivity Breakdown by State Variable\n(Scaled Hessian Diagonals)",
+        "Parameter Sensitivity Breakdown by State Variable",
         fontsize=16,
         fontweight="bold",
     )

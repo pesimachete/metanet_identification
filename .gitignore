@@ -5,3 +5,4 @@ __pycache__/
 # Local project directories
 opt/
 tests/
+bad_codes/
