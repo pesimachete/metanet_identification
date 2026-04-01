@@ -67,18 +67,6 @@ class BoundarySequence(typing.NamedTuple):
     s: jax.Array  # s_i(1...K)     : Off-ramp flows per section
 
 
-class EmpiricalData(typing.NamedTuple):
-    """
-    Ground truth measurements from real-world sensors over the time horizon K.
-    Used exclusively in the loss function to compare against SimulationTrajectory.
-    Arrays have shape (K, N).
-    Note: If a section has no sensor, you can apply a boolean mask during the loss calculation.
-    """
-
-    speed: jax.Array  # v_real(1...K) : Measured speeds
-    flow: jax.Array  # q_real(1...K) : Measured flows
-
-
 def steady_state_speed(density: jax.Array, p: NetworkParameters) -> jax.Array:
     """Computes the equilibrium speed V(rho) based on the standard exponential fundamental diagram."""
     return p.free_flow_speed * jnp.exp(
@@ -139,7 +127,6 @@ def update_speed(
     return jnp.maximum(next_speed, 0.0)
 
 
-@jax.jit
 def metanet_step(
     state: NetworkState, boundaries_k: BoundarySequence, p: NetworkParameters
 ) -> tuple[NetworkState, NetworkState]:
