@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-import parametanet
-import parapersistentExitationSimulation as peSim
+import paraMetanet.parametanet as parametanet
+import paraMetanet.parapersistentExitationSimulation as peSim
 
 print("Available devices:", jax.devices())
 

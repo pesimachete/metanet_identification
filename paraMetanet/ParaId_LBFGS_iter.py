@@ -18,9 +18,8 @@ import jax.numpy as jnp
 import optax
 
 
-import parametanet
+import parametanet as parametanet
 import parapersistentExitationSimulation as peSim
-
 
 print(jax.devices())
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
@@ -56,26 +55,6 @@ def get_physical_params(
         free_flow_speed=jax.nn.softplus(raw_metanet_params.free_flow_speed)
         * scales.free_flow_speed,
     )
-
-
-def calc_param_errors(params, p_true, mask, scales):
-
-    errors = {}
-    physical_metanet = get_physical_params(params.metanet, scales)
-
-    for field in physical_metanet._fields:
-        m = getattr(mask.metanet, field)
-
-        if jnp.any(m > 0):
-            p_pred = getattr(physical_metanet, field)
-            p_tgt = getattr(p_true, field)
-
-            rel_diff = jnp.abs((p_pred - p_tgt) / (p_tgt + 1e-8))
-
-            error_term = jnp.sum(rel_diff) / (jnp.sum(m) + 1e-8)
-            errors[field] = error_term
-
-    return errors
 
 
 def nll_loss(
@@ -129,22 +108,37 @@ def nll_loss(
             p_norm = 0.5 * (jnp.abs(p_pred[:-1] + p_pred[1:]) + 1e-8)
             reg_loss += jnp.sum((p_diff / p_norm) ** 2)
 
-    return base_loss + 1 / 2 * (penalty_weight * reg_loss)
+    return base_loss + (penalty_weight * reg_loss)
 
 
 traj_true, p_true, boundaries, init_stat = peSim.simulate_example()
 
 
-ssq = 10e-2
+ssq = 10e-3
 
 
 def disturb_measurment(key, measurment):
     return jnp.exp(jax.random.normal(key, measurment.shape) * ssq) * measurment
 
 
-keys = jax.random.split(jax.random.PRNGKey(1129), 2)
-new_flow = disturb_measurment(keys[0], traj_true.flow)
-new_speed = disturb_measurment(keys[1], traj_true.speed)
+def disturb_measurment_gaussian_additive(key, measurment):
+    return (
+        jnp.mean(measurment) * jax.random.normal(key, measurment.shape) * ssq
+        + measurment
+    )
+
+
+def disturb_measurment_student_t(key, measurment):
+    df = 15  # degrees of freedom for the Student's t-distribution
+    return (
+        jnp.mean(measurment) * jax.random.t(key, shape=measurment.shape, df=df) * ssq
+        + measurment
+    )
+
+
+keys = jax.random.split(jax.random.PRNGKey(1131), 2)
+new_flow = disturb_measurment_student_t(keys[0], traj_true.flow)
+new_speed = disturb_measurment_student_t(keys[1], traj_true.speed)
 new_density = new_flow / new_speed * p_true.lambda_
 trj_dis = parametanet.SimulationTrajectory(
     density=new_density,
@@ -167,7 +161,7 @@ def perturb_and_inv_softplus_vec(key, true_val, scale, d=0.6):
     return inv_softplus(perturbed, scale)
 
 
-def perturb_and_inv_softplus_float(key, true_val, scale, d=0.3):
+def perturb_and_inv_softplus_float(key, true_val, scale, d=0.4):
     perturbed = jax.random.uniform(
         key,
         (),
@@ -177,7 +171,7 @@ def perturb_and_inv_softplus_float(key, true_val, scale, d=0.3):
     return inv_softplus(perturbed, scale)
 
 
-keys = jax.random.split(jax.random.PRNGKey(2441), 7)
+keys = jax.random.split(jax.random.PRNGKey(2447), 7)
 scales = parametanet.ParaNetworkParameters(
     beta=10 ** (jnp.floor(jnp.log10(p_true.beta))),
     free_flow_speed=10 ** (jnp.floor(jnp.log10(p_true.free_flow_speed))),
@@ -251,7 +245,7 @@ opt_state = optimizer.init(initial_params)
 
 @jax.jit
 def update_step(params, opt_state, traj_true, initial_state, boundaries, scales, mask):
-    penalty_weight = 10
+    penalty_weight = 60
 
     def value_fn(p):
         # Apply the mask dynamically inside the closure
@@ -293,7 +287,7 @@ def optimization_generator(
 ):
     prev_loss = jnp.float64("inf")
     loss_memo = 0.0
-    mem_loss = 0.9
+    mem_loss = 0.8
 
     pbar = tqdm.tqdm(itertools.count(), desc="Optimizing")
 

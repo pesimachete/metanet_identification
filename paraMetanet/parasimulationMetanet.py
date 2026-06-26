@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
-import parametanet
+import paraMetanet.parametanet as parametanet
 
 
 def simulate_example():

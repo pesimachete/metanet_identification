@@ -8,7 +8,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.flatten_util
 
-import parametanet
+import parametanet as parametanet
 import parapersistentExitationSimulation as pes
 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
@@ -71,7 +71,8 @@ def compute_full_hessian(
     # Calculate the normalized Hessian
     scaled_H_matrix = H_matrix / denominator
 
-    return scaled_H_matrix, block_sizes, empirical_fields
+    eigenvalues, eigenvectors = jnp.linalg.eigh(scaled_H_matrix)
+    return scaled_H_matrix, block_sizes, empirical_fields, eigenvalues, eigenvectors
 
 
 def plot_full_hessian(H_matrix, block_sizes, fields):
@@ -127,9 +128,22 @@ if __name__ == "__main__":
     baseline_traj, p0, boundaries_seq, init_state = pes.simulate_example()
 
     print("\n2. Calculating 2nd-order parameter dependencies (Complete Hessian)...")
-    H_matrix, block_sizes, fields = compute_full_hessian(
+    H_matrix, block_sizes, fields, eigenvalues, eigenvectors = compute_full_hessian(
         p0, init_state, boundaries_seq, baseline_traj
     )
+
+    print(f"Eigenvalues: {eigenvalues}")
+    # Look at the LAST eigenvectors (largest eigenvalues)
+    for i in [-1, -2, -3, 3, 2, 1]:
+        vec = eigenvectors[:, i]
+        print(f"\nEigenvalue: {eigenvalues[i]:.4f}")
+        # Report block norms
+        idx = 0
+        for field in fields:
+            size = block_sizes[field]
+            block = vec[idx : idx + size]
+            print(f"  {field}: norm={jnp.linalg.norm(block):.4f}")
+            idx += size
 
     print("\n3. Computation complete. Generating dependency heatmap...")
     plot_full_hessian(H_matrix, block_sizes, fields)

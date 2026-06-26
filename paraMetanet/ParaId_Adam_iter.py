@@ -18,8 +18,8 @@ import jax.numpy as jnp
 import optax
 
 
-import parametanet
-import parasimulationMetanet as peSim
+import paraMetanet.parametanet as parametanet
+import paraMetanet.parasimulationMetanet as peSim
 
 
 print(jax.devices())

@@ -2,7 +2,7 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 
-import parasimulationMetanet as peSim
+import paraMetanet.parasimulationMetanet as peSim
 
 
 def plot_full_convergence(

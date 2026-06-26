@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-import parametanet
+import parametanet as parametanet
 
 
 def generate_prbs_jax(
@@ -114,7 +114,7 @@ def simulate_example():
     # ---------------------------
     T = 10.0 / 3600.0
     steps_per_hour = int(3600 / 10)
-    K = 72 * steps_per_hour
+    K = 144 * steps_per_hour
 
     L = jnp.full(N, 0.5)
     lambda_ = jnp.full(N, 1.0)
@@ -122,8 +122,8 @@ def simulate_example():
     # ---------------------------
     # 2. Corrected Physical Parameters
     # ---------------------------
-    vf = jnp.full(N, 120.0)
-    rho_cr = jnp.full(N, 32.0)
+    vf = jnp.concatenate([jnp.full(N // 2, 120.0), jnp.full(N // 2, 100.0)])
+    rho_cr = jnp.concatenate([jnp.full(N // 2, 32.0), jnp.full(N // 2, 28.0)])
     alpha = jnp.full(N, 1.8)
 
     tau = 0.08
@@ -241,5 +241,5 @@ if __name__ == "__main__":
     print("Speed at t=0:", traj.speed[0])
     print("Flow at t=0:", traj.flow[0])
     plot_trajectories(
-        traj, boundaries.r, N=20, K=72 * 360
+        traj, boundaries.r, N=20, K=144 * 360
     )  # Adjust K if you change the horizon
