@@ -1,0 +1,13 @@
+# JAX for high-performance numerical computing and autodiff (CPU version by default)
+jax>=0.4.0
+jaxlib>=0.4.0
+
+# Core scientific and plotting libraries
+numpy>=1.22.0
+matplotlib>=3.5.0
+
+# Progress bars
+tqdm>=4.64.0
+
+# Interruptible execution wrapper
+interruptible-list>=0.1.1
