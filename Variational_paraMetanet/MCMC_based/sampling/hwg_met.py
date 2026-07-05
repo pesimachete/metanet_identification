@@ -1,6 +1,7 @@
 import os
 import pickle
 import typing
+import functools
 from datetime import datetime
 import matplotlib.pyplot as plt
 
@@ -10,18 +11,14 @@ os.environ["JAX_PLATFORM"] = "cpu"
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tqdm import tqdm
 from Variational_paraMetanet.MCMC_based.simulator import parametanet
 from Variational_paraMetanet.MCMC_based.simulator import (
     parapersistentExitationSimulation as peSim,
 )
 
-from tqdm import tqdm
-from core.parameter_handling import (
-    PriorParameters,
-    DataLogVariance,
-    map_to_physical_params,
-)
-from core.parameter_handling import (
+
+from Variational_paraMetanet.MCMC_based.core.parameter_handling import (
     PriorParameters,
     DataLogVariance,
     map_to_physical_params,
@@ -32,6 +29,163 @@ def save_mcmc_results(filepath, results_dict):
     with open(filepath, "wb") as f:
         pickle.dump(results_dict, f)
     print(f"\n[+] Successfully saved all MCMC data to: {filepath}")
+
+
+def _log_likelihood(
+    latent_sample: parametanet.ParaNetworkLatentParameters,
+    params_fis: parametanet.ParaNetworkScalarParameters,
+    params_static: parametanet.ParaNetworkStaticParameters,
+    scales_scalar: parametanet.ParaNetworkScalarParameters,
+    data_log_variance: DataLogVariance,
+    init_state: parametanet.NetworkState,
+    traj_true: parametanet.SimulationTrajectory,
+    boundaries: parametanet.BoundarySequence,
+) -> jax.Array:
+    candidate_params = map_to_physical_params(
+        unconstrained_latent=latent_sample,
+        unconstrained_scalar=params_fis,
+        params_static=params_static,
+        scales_scalar=scales_scalar,
+    )
+    sim = parametanet.rollout_simulation(init_state, boundaries, candidate_params)
+    r2_v = jnp.exp(data_log_variance.log_var_speed) + 1e-8
+    r2_f = jnp.exp(data_log_variance.log_var_flow) + 1e-8
+
+    ll_v = -0.5 * jnp.sum(
+        (jnp.log(sim.speed + 1e-8) - jnp.log(traj_true.speed + 1e-8)) ** 2
+    ) / r2_v - 0.5 * sim.speed.size * jnp.log(r2_v)
+    ll_f = -0.5 * jnp.sum(
+        (jnp.log(sim.flow + 1e-8) - jnp.log(traj_true.flow + 1e-8)) ** 2
+    ) / r2_f - 0.5 * sim.flow.size * jnp.log(r2_f)
+    return ll_v + ll_f
+
+
+def _log_prior(
+    latent_sample: parametanet.ParaNetworkLatentParameters,
+    params_lat: PriorParameters,
+) -> jax.Array:
+    var_prior = jnp.exp(params_lat.log_var)
+    corr = jnp.tanh(params_lat.corr)  # bijector: keeps |corr| < 1
+    coeff = (var_prior * (1 - corr**2) + 1e-8) ** (-1)
+    e = jnp.stack(
+        [
+            latent_sample.alpha - params_lat.mean[0],
+            latent_sample.critical_density - params_lat.mean[1],
+            latent_sample.free_flow_speed - params_lat.mean[2],
+        ]
+    )
+    quad = coeff * (
+        e[:, 0] ** 2
+        + e[:, -1] ** 2
+        + (1 + corr**2) * jnp.sum(e[:, 1:-1] ** 2, axis=1)
+        - 2 * corr * jnp.sum(e[:, :-1] * e[:, 1:], axis=1)
+    )
+    return -0.5 * jnp.sum(quad)
+
+
+@jax.jit
+def log_posterior(
+    latent_sample: parametanet.ParaNetworkLatentParameters,
+    params_fis: parametanet.ParaNetworkScalarParameters,
+    params_lat: PriorParameters,
+    params_static: parametanet.ParaNetworkStaticParameters,
+    scales_scalar: parametanet.ParaNetworkScalarParameters,
+    data_log_variance: DataLogVariance,
+    init_state: parametanet.NetworkState,
+    traj_true: parametanet.SimulationTrajectory,
+    boundaries: parametanet.BoundarySequence,
+) -> jax.Array:
+    return _log_likelihood(
+        latent_sample,
+        params_fis,
+        params_static,
+        scales_scalar,
+        data_log_variance,
+        init_state,
+        traj_true,
+        boundaries,
+    ) + _log_prior(latent_sample, params_lat)
+
+
+@functools.partial(jax.jit, static_argnames=("num_blocks",))
+def gibbs_step(
+    current_sample: parametanet.ParaNetworkLatentParameters,
+    current_log_post: jax.Array,
+    variances: jax.Array,
+    key: jax.Array,
+    params_fis: parametanet.ParaNetworkScalarParameters,
+    params_lat: PriorParameters,
+    params_static: parametanet.ParaNetworkStaticParameters,
+    scales_scalar: parametanet.ParaNetworkScalarParameters,
+    data_log_variance: DataLogVariance,
+    init_state: parametanet.NetworkState,
+    traj_true: parametanet.SimulationTrajectory,
+    boundaries: parametanet.BoundarySequence,
+    num_blocks: int,
+) -> tuple[parametanet.ParaNetworkLatentParameters, jax.Array, jax.Array]:
+    N = current_sample.alpha.shape[0]
+    keys = jax.random.split(key, 3 * num_blocks * 2)
+    acceptances = jnp.zeros((3, num_blocks), dtype=jnp.float32)
+
+    curr_samp = current_sample
+    curr_lp = current_log_post
+    key_idx = 0
+
+    for p_idx in range(3):
+        for b in range(num_blocks):
+            mask = (jnp.arange(N) * num_blocks // N) == b
+            noise = jax.random.normal(keys[key_idx], shape=(N,))
+            u = jax.random.uniform(keys[key_idx + 1])
+            key_idx += 2
+
+            if p_idx == 0:
+                prop_val = jnp.where(
+                    mask, curr_samp.alpha + noise * variances[0, b], curr_samp.alpha
+                )
+                prop_samp = parametanet.ParaNetworkLatentParameters(
+                    prop_val, curr_samp.critical_density, curr_samp.free_flow_speed
+                )
+            elif p_idx == 1:
+                prop_val = jnp.where(
+                    mask,
+                    curr_samp.critical_density + noise * variances[1, b],
+                    curr_samp.critical_density,
+                )
+                prop_samp = parametanet.ParaNetworkLatentParameters(
+                    curr_samp.alpha, prop_val, curr_samp.free_flow_speed
+                )
+            else:
+                prop_val = jnp.where(
+                    mask,
+                    curr_samp.free_flow_speed + noise * variances[2, b],
+                    curr_samp.free_flow_speed,
+                )
+                prop_samp = parametanet.ParaNetworkLatentParameters(
+                    curr_samp.alpha, curr_samp.critical_density, prop_val
+                )
+
+            lp_prop = log_posterior(
+                prop_samp,
+                params_fis,
+                params_lat,
+                params_static,
+                scales_scalar,
+                data_log_variance,
+                init_state,
+                traj_true,
+                boundaries,
+            )
+            accept = jnp.log(u) < (lp_prop - curr_lp)
+
+            curr_samp, curr_lp = jax.lax.cond(
+                accept,
+                lambda _: (prop_samp, lp_prop),
+                lambda _: (curr_samp, curr_lp),
+                None,
+            )
+            acceptances = acceptances.at[p_idx, b].set(accept)
+
+    return curr_samp, curr_lp, acceptances
 
 
 def Hasting_within_gibbs_sampling(
@@ -47,146 +201,36 @@ def Hasting_within_gibbs_sampling(
     iterations: int,
     adapt_alpha: float,
     adapt_beta: float,
+    key: jax.Array,
+    init_latent: parametanet.ParaNetworkLatentParameters | None = None,
     num_blocks: int = 4,
-) -> tuple[list[jax.Array], list[jax.Array], list[jax.Array], jax.Array]:
-    key = jax.random.PRNGKey(67)
-    params_history = []
-    variance_history = []
+) -> tuple[list, list, list, jax.Array]:
+    """Full-history diagnostic run (used by main()). For the hot training loop
+    use mcmc_advance() below instead — this keeps a Python list per iteration
+    so it stays slow-but-inspectable on purpose."""
 
-    # Initialize with the prior mean
-    params_lat_sample = parametanet.ParaNetworkLatentParameters(
-        alpha=params_lat.mean[0],
-        critical_density=params_lat.mean[1],
-        free_flow_speed=params_lat.mean[2],
+    if init_latent is None:
+        init_latent = parametanet.ParaNetworkLatentParameters(
+            alpha=params_lat.mean[0],
+            critical_density=params_lat.mean[1],
+            free_flow_speed=params_lat.mean[2],
+        )
+
+    params_history, variance_history, ar_history = [], [], []
+    params_lat_sample = init_latent
+    log_post = log_posterior(
+        params_lat_sample,
+        params_fis,
+        params_lat,
+        params_static,
+        scales_scalar,
+        data_log_variance,
+        init_state,
+        traj_true,
+        boundaries,
     )
-
-    def log_likelihood(latent_sample: parametanet.ParaNetworkLatentParameters) -> float:
-
-        candidate_params = map_to_physical_params(
-            unconstrained_latent=latent_sample,
-            unconstrained_scalar=params_fis,
-            params_static=params_static,
-            scales_scalar=scales_scalar,
-        )
-
-        sim = parametanet.rollout_simulation(init_state, boundaries, candidate_params)
-        r2_v = jnp.exp(data_log_variance.log_var_speed) + 1e-8
-        r2_f = jnp.exp(data_log_variance.log_var_flow) + 1e-8
-
-        ll_v = (
-            -0.5
-            * jnp.sum(
-                (jnp.log(sim.speed + 1e-8) - jnp.log(traj_true.speed + 1e-8)) ** 2
-            )
-            / r2_v
-        )
-        ll_f = (
-            -0.5
-            * jnp.sum((jnp.log(sim.flow + 1e-8) - jnp.log(traj_true.flow + 1e-8)) ** 2)
-            / r2_f
-        )
-        return ll_v + ll_f
-
-    def log_prior(latent_sample: parametanet.ParaNetworkLatentParameters) -> jax.Array:
-        var_prior = jnp.exp(params_lat.log_var)
-        coeff = (var_prior * (1 - params_lat.corr**2) + 1e-8) ** (-1)
-        e = jnp.array(
-            [
-                latent_sample.alpha - params_lat.mean[0],
-                latent_sample.critical_density - params_lat.mean[1],
-                latent_sample.free_flow_speed - params_lat.mean[2],
-            ]
-        )
-        einve = coeff * (
-            e[:, 0] ** 2
-            + e[:, -1] ** 2
-            + (1 + params_lat.corr**2) * jnp.sum(e[:, 1:-1] ** 2, axis=1)
-            - 2 * params_lat.corr * jnp.sum(e[:, :-1] * e[:, 1:], axis=1)
-        )
-        return -0.5 * einve
-
-    @jax.jit
-    def log_posterior(latent_sample):
-        return log_likelihood(latent_sample) + jnp.sum(
-            log_prior(latent_sample), dtype=float
-        )
-
-    @jax.jit
-    def gibbs_step(
-        current_sample: parametanet.ParaNetworkLatentParameters,
-        current_log_post: float,
-        variances: jax.Array,  # Shape: (3, num_blocks)
-        key: jax.Array,
-    ) -> tuple[parametanet.ParaNetworkLatentParameters, float, jax.Array]:
-        N = current_sample.alpha.shape[0]
-
-        keys = jax.random.split(key, 3 * num_blocks * 2)
-        acceptances = jnp.zeros((3, num_blocks), dtype=jnp.float32)
-
-        curr_samp = current_sample
-        curr_lp = current_log_post
-
-        key_idx = 0
-
-        for p_idx in range(3):
-            for b in range(num_blocks):
-
-                mask = (jnp.arange(N) * num_blocks // N) == b
-
-                noise = jax.random.normal(keys[key_idx], shape=(N,))
-                u = jax.random.uniform(keys[key_idx + 1])
-                key_idx += 2
-
-                # 0: Alpha, 1: Rho, 2: V_free
-
-                if p_idx == 0:
-                    curr_val = curr_samp.alpha
-                    prop_val = jnp.where(
-                        mask,
-                        curr_val + noise * variances[0, b],
-                        curr_val,
-                    )
-                    prop_samp = parametanet.ParaNetworkLatentParameters(
-                        prop_val, curr_samp.critical_density, curr_samp.free_flow_speed
-                    )
-                elif p_idx == 1:
-                    curr_val = curr_samp.critical_density
-                    prop_val = jnp.where(
-                        mask,
-                        curr_val + noise * variances[1, b],
-                        curr_val,
-                    )
-                    prop_samp = parametanet.ParaNetworkLatentParameters(
-                        curr_samp.alpha, prop_val, curr_samp.free_flow_speed
-                    )
-                else:
-                    curr_val = curr_samp.free_flow_speed
-                    prop_val = jnp.where(
-                        mask,
-                        curr_val + noise * variances[2, b],
-                        curr_val,
-                    )
-                    prop_samp = parametanet.ParaNetworkLatentParameters(
-                        curr_samp.alpha, curr_samp.critical_density, prop_val
-                    )
-
-                lp_prop = log_posterior(prop_samp)
-                accept = jnp.log(u) < (lp_prop - curr_lp)
-
-                curr_samp = jax.lax.cond(
-                    accept, lambda _: prop_samp, lambda _: curr_samp, None
-                )
-                curr_lp = jax.lax.cond(
-                    accept, lambda _: lp_prop, lambda _: curr_lp, None
-                )
-                acceptances = acceptances.at[p_idx, b].set(accept)
-
-        return curr_samp, curr_lp, acceptances
-
-    log_post = log_posterior(params_lat_sample)
     total_acceptances = jnp.zeros((3, num_blocks))
     filtered_ar = jnp.zeros((3, num_blocks), dtype=jnp.float32)
-    ar_history = []
 
     for i in range(iterations):
         params_history.append(params_lat_sample)
@@ -194,7 +238,19 @@ def Hasting_within_gibbs_sampling(
 
         key, subkey = jax.random.split(key)
         params_lat_sample, log_post, accepted = gibbs_step(
-            params_lat_sample, log_post, mcmc_variance, subkey
+            params_lat_sample,
+            log_post,
+            mcmc_variance,
+            subkey,
+            params_fis,
+            params_lat,
+            params_static,
+            scales_scalar,
+            data_log_variance,
+            init_state,
+            traj_true,
+            boundaries,
+            num_blocks=num_blocks,
         )
 
         total_acceptances += accepted
@@ -206,6 +262,57 @@ def Hasting_within_gibbs_sampling(
         )
 
     return params_history, variance_history, ar_history, total_acceptances / iterations
+
+
+@functools.partial(jax.jit, static_argnames=("iterations", "num_blocks"))
+def mcmc_advance(
+    z_init: parametanet.ParaNetworkLatentParameters,
+    log_post_init: jax.Array,
+    mcmc_variance: jax.Array,
+    key: jax.Array,
+    params_fis: parametanet.ParaNetworkScalarParameters,
+    params_lat: PriorParameters,
+    params_static: parametanet.ParaNetworkStaticParameters,
+    scales_scalar: parametanet.ParaNetworkScalarParameters,
+    data_log_variance: DataLogVariance,
+    init_state: parametanet.NetworkState,
+    traj_true: parametanet.SimulationTrajectory,
+    boundaries: parametanet.BoundarySequence,
+    iterations: int,
+    adapt_alpha: float,
+    adapt_beta: float,
+    num_blocks: int,
+):
+    """Warm-started, no-history chain advance for the outer MCMC-SGD loop.
+    Call this once per epoch with z_init = state.z (NOT the prior mean)."""
+
+    def scan_body(carry, subkey):
+        samp, lp, variances = carry
+        samp_new, lp_new, accepted = gibbs_step(
+            samp,
+            lp,
+            variances,
+            subkey,
+            params_fis,
+            params_lat,
+            params_static,
+            scales_scalar,
+            data_log_variance,
+            init_state,
+            traj_true,
+            boundaries,
+            num_blocks=num_blocks,
+        )
+        variances_new = jnp.where(
+            accepted == 1.0, variances * adapt_alpha, variances * adapt_beta
+        )
+        return (samp_new, lp_new, variances_new), accepted
+
+    keys = jax.random.split(key, iterations)
+    (z_final, lp_final, var_final), acc_hist = jax.lax.scan(
+        scan_body, (z_init, log_post_init, mcmc_variance), keys
+    )
+    return z_final, lp_final, var_final, jnp.mean(acc_hist, axis=0)
 
 
 def disturb_measurment(key: jax.Array, measurment: jax.Array):

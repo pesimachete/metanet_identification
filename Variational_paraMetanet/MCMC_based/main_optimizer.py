@@ -1,5 +1,9 @@
 import os
 import itertools
+
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["JAX_PLATFORM"] = "cpu"
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,18 +21,19 @@ from Variational_paraMetanet.MCMC_based.core.parameter_handling import (
     Theta,
     PriorParameters,
     DataLogVariance,
+    to_unconstrained,
 )
 from Variational_paraMetanet.MCMC_based.core.adagrad import (
     LearningState,
     init_adagrad,
-    compute_lr,
 )
 from Variational_paraMetanet.MCMC_based.core.objective import (
     pure_update_step,
-    log_joint,
+    log_joint_jit,
 )
 from Variational_paraMetanet.MCMC_based.sampling.hwg_met import (
-    Hasting_within_gibbs_sampling,
+    log_posterior,
+    mcmc_advance,
 )
 from Variational_paraMetanet.MCMC_based.utils import visualization
 
@@ -41,6 +46,7 @@ def disturb_measurment(key: jax.Array, measurment: jax.Array):
 
 def mcmc_draw(
     state: LearningState,
+    key: jax.Array,
     params_static: parametanet.ParaNetworkStaticParameters,
     scales_scalar: parametanet.ParaNetworkScalarParameters,
     init_net_state: parametanet.NetworkState,
@@ -52,7 +58,23 @@ def mcmc_draw(
     adapt_beta: float,
 ) -> tuple[parametanet.ParaNetworkLatentParameters, jax.Array]:
 
-    history, var_history, _, _ = Hasting_within_gibbs_sampling(
+    log_post0 = log_posterior(
+        state.z,
+        state.theta.scalar,
+        state.theta.prior,
+        params_static,
+        scales_scalar,
+        state.theta.obs_var,
+        init_net_state,
+        traj_true,
+        boundaries,
+    )
+
+    z_new, _, var_new, _ = mcmc_advance(
+        z_init=state.z,
+        log_post_init=log_post0,
+        mcmc_variance=state.mcmc_variance,
+        key=key,
         params_fis=state.theta.scalar,
         params_lat=state.theta.prior,
         params_static=params_static,
@@ -61,13 +83,12 @@ def mcmc_draw(
         init_state=init_net_state,
         traj_true=traj_true,
         boundaries=boundaries,
-        mcmc_variance=state.mcmc_variance,
         iterations=sampler_iters,
         adapt_alpha=adapt_alpha,
         adapt_beta=adapt_beta,
         num_blocks=num_blocks,
     )
-    return history[-1], var_history[-1]
+    return z_new, var_new
 
 
 def optimization_generator(
@@ -86,7 +107,8 @@ def optimization_generator(
     num_blocks: int = 4,
     sampler_iters: int = 10,
     adapt_alpha: float = 1.01,
-    patience_epochs: int = 5000,  # Early stopping patience
+    patience_epochs: int = 5000,
+    mcmc_key: jax.Array = jax.random.PRNGKey(0),
 ):
 
     adapt_beta = float(
@@ -99,9 +121,10 @@ def optimization_generator(
         adagrad=init_adagrad(theta_init),
         adagrad_eps=adagrad_eps,
         mcmc_variance=jnp.full((3, num_blocks), 0.05),
-        k=0,
-        k_end_heat=None,
-        ema_norm=0.0,
+        k=jnp.array(0, dtype=jnp.int32),
+        k_end_heat=jnp.array(0, dtype=jnp.int32),
+        heat_ended=jnp.array(False),
+        ema_norm=jnp.array(0.0),
     )
 
     latent_names = ["alpha", "critical_density", "free_flow_speed"]
@@ -114,11 +137,11 @@ def optimization_generator(
 
     for epoch in pbar:
         k = state.k
-        gamma = compute_lr(k, k_pre, state.k_end_heat, gamma_0, alpha_decay)
+        epoch_key = jax.random.fold_in(mcmc_key, epoch)
 
-        # 1. MCMC Step (Draw z)
         z_new, mcmc_var_new = mcmc_draw(
             state,
+            epoch_key,
             params_static,
             scales_scalar,
             init_net_state,
@@ -130,13 +153,13 @@ def optimization_generator(
             adapt_beta,
         )
 
-        # 2. Gradient Step
-        state, norm_jax, ema_new_jax = pure_update_step(
+        state, norm_jax, ema_new_jax, gamma_jax = pure_update_step(
             state,
             z_new,
             mcmc_var_new,
-            gamma,
             k_pre,
+            gamma_0,
+            alpha_decay,
             c_heat,
             params_static,
             scales_scalar,
@@ -147,17 +170,20 @@ def optimization_generator(
 
         norm = float(norm_jax)
         ema_new = float(ema_new_jax)
+        gamma = float(gamma_jax)
+        k_int = int(k)
 
-        # Heating / Cooling phase transition logic
-        if k >= k_pre and state.k_end_heat is None:
+        if k_int >= k_pre and not bool(state.heat_ended):
             if ema_new > best_norm:
-                state = state._replace(k_end_heat=k)
-                pbar.write(f"[SGD] Heating ended at k={k}. Starting cooling phase.")
+                state = state._replace(
+                    k_end_heat=jnp.array(k_int, dtype=jnp.int32),
+                    heat_ended=jnp.array(True),
+                )
+                pbar.write(f"[SGD] Heating ended at k={k_int}. Starting cooling phase.")
             else:
                 best_norm = ema_new
 
-        # Early stopping logic (monitors the EMA norm during cooling)
-        if state.k_end_heat is not None:
+        if bool(state.heat_ended):
             if ema_new < best_norm:
                 best_norm = ema_new
                 steps_without_improvement = 0
@@ -166,8 +192,8 @@ def optimization_generator(
 
         phase = (
             "pre-heat"
-            if k < k_pre
-            else ("heat" if state.k_end_heat is None else "cool")
+            if k_int < k_pre
+            else ("heat" if not bool(state.heat_ended) else "cool")
         )
         pbar.set_description(
             f"Phase: {phase} | ‖g‖ EMA: {ema_new:.4f} | Wait: {steps_without_improvement}/{patience_epochs}"
@@ -177,7 +203,7 @@ def optimization_generator(
         if epoch % log_every == 0 or steps_without_improvement >= patience_epochs:
             # Calculate Joint Log Likelihood for diagnostic plotting
             current_log_joint = float(
-                log_joint(
+                log_joint_jit(
                     state.theta,
                     z_new,
                     params_static,
@@ -189,8 +215,7 @@ def optimization_generator(
             )
 
             cached_curr_p = {
-                name: np.array(getattr(state.theta.latent, name))
-                for name in latent_names
+                name: np.array(getattr(z_new, name)) for name in latent_names
             }
 
             # The MCMC optimizer only has MAP point estimates for theta (no variational stds)
@@ -199,7 +224,7 @@ def optimization_generator(
             }
 
             cached_curr_pr_p = {
-                name: float(state.theta.prior.mean[i])
+                name: np.array(state.theta.prior.mean[i])
                 for i, name in enumerate(latent_names)
             }
             cached_curr_pr_s = {
@@ -207,7 +232,7 @@ def optimization_generator(
                 for i, name in enumerate(latent_names)
             }
             cached_curr_pr_corr = {
-                name: float(state.theta.prior.corr) for name in latent_names
+                name: float(jnp.tanh(state.theta.prior.corr)) for name in latent_names
             }
 
             for field in scalar_names:
@@ -261,21 +286,42 @@ if __name__ == "__main__":
     N = full_p_true.static_params.L.shape[0]
     key_lat, key_sca = jax.random.split(keys[2])
 
-    # Add Gaussian noise directly in the unconstrained space
-    # (Scale of 0.5 creates a noticeable disturbance but keeps it roughly within bounds)
+    # full_p_true.latent_params / scalar_params are PHYSICAL values.
+    # z / theta.latent / theta.scalar live in the unconstrained pre-softplus
+    # space, so the true values must go through the inverse transform BEFORE
+    # noise is added — otherwise softplus(physical) * scale blows up.
+    alpha_uncon = to_unconstrained(full_p_true.latent_params.alpha, 1.0)
+    rho_cr_uncon = to_unconstrained(full_p_true.latent_params.critical_density, 10.0)
+    v_free_uncon = to_unconstrained(full_p_true.latent_params.free_flow_speed, 100.0)
+
     lat_noise = jax.random.normal(key_lat, (3, N)) * 0.5
     disturbed_latent = parametanet.ParaNetworkLatentParameters(
-        alpha=full_p_true.latent_params.alpha + lat_noise[0],
-        critical_density=full_p_true.latent_params.critical_density + lat_noise[1],
-        free_flow_speed=full_p_true.latent_params.free_flow_speed + lat_noise[2],
+        alpha=alpha_uncon + lat_noise[0],
+        critical_density=rho_cr_uncon + lat_noise[1],
+        free_flow_speed=v_free_uncon + lat_noise[2],
+    )
+
+    # scales_scalar == full_p_true.scalar_params, so physical/scale == 1 for
+    # every field at zero noise — this correctly recovers the true value.
+    beta_uncon = to_unconstrained(
+        full_p_true.scalar_params.beta, full_p_true.scalar_params.beta
+    )
+    mu_uncon = to_unconstrained(
+        full_p_true.scalar_params.mu, full_p_true.scalar_params.mu
+    )
+    kappa_uncon = to_unconstrained(
+        full_p_true.scalar_params.kappa, full_p_true.scalar_params.kappa
+    )
+    gamma_uncon = to_unconstrained(
+        full_p_true.scalar_params.gamma, full_p_true.scalar_params.gamma
     )
 
     sca_noise = jax.random.normal(key_sca, (4,)) * 0.5
     disturbed_scalar = parametanet.ParaNetworkScalarParameters(
-        beta=full_p_true.scalar_params.beta + sca_noise[0],
-        mu=full_p_true.scalar_params.mu + sca_noise[1],
-        kappa=full_p_true.scalar_params.kappa + sca_noise[2],
-        gamma=full_p_true.scalar_params.gamma + sca_noise[3],
+        beta=beta_uncon + sca_noise[0],
+        mu=mu_uncon + sca_noise[1],
+        kappa=kappa_uncon + sca_noise[2],
+        gamma=gamma_uncon + sca_noise[3],
     )
 
     # ---------------------------------------------------------
@@ -287,7 +333,7 @@ if __name__ == "__main__":
         prior=PriorParameters(
             mean=jnp.array([jnp.full(N, 1.62), jnp.full(N, 3.16), jnp.full(N, 0.84)]),
             log_var=jnp.log(jnp.array([0.005, 0.005, 0.005])),
-            corr=jnp.array(0.95),
+            corr=jnp.arctanh(jnp.array(0.95)),
         ),
         obs_var=DataLogVariance(
             log_var_flow=jnp.log(jnp.array(0.01)),
@@ -307,8 +353,8 @@ if __name__ == "__main__":
             log_every=5,
             k_pre=100,
             num_blocks=20,
-            sampler_iters=10,
-            patience_epochs=500,  # Stops if norm doesn't decrease for 500 steps
+            sampler_iters=1,
+            patience_epochs=2000,
         ),
         save_whole=True,
         callback_whole=lambda res: visualization.print_whole(

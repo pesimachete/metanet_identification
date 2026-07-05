@@ -106,39 +106,39 @@ def print_whole(results, p_true=None, block=False):
                     alpha=0.8,
                 )
 
-        # 2. Plot Global Prior
+        # 2. Plot Segment-wise Prior
         prior_hist_z = prior_param_histories[field]
         prior_std_z = prior_std_histories[field]
-        phys_prior_mean = to_physical(prior_hist_z, scale)
-        phys_prior_upper = to_physical(prior_hist_z + prior_std_z, scale)
-        phys_prior_lower = to_physical(prior_hist_z - prior_std_z, scale)
 
-        ax_mean.plot(
-            epochs_list,
-            phys_prior_mean,
-            linestyle="--",
-            alpha=0.8,
-            linewidth=3,
-            color="black",
-            label="Global Prior Mean",
-        )
-        ax_mean.fill_between(
-            epochs_list,
-            phys_prior_lower,
-            phys_prior_upper,
-            color="black",
-            alpha=0.15,
-            label="Prior Std Dev",
-        )
+        # Ensure it's 2D for the loop just in case
+        if prior_hist_z.ndim == 1:
+            prior_hist_z = prior_hist_z.reshape(-1, 1)
 
-        ax_mean.set_title(f"Physical Estimates: {field}")
-        ax_mean.set_xlabel("Epochs")
-        ax_mean.grid(True, linestyle=":", alpha=0.5)
+        # Loop through each of the 20 segments for the prior
+        for segment_idx in range(prior_hist_z.shape[1]):
+            p_hist_z_seg = prior_hist_z[:, segment_idx]
 
-        handles, labels = ax_mean.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        ax_mean.legend(by_label.values(), by_label.keys(), loc="upper right")
+            phys_prior_mean = to_physical(p_hist_z_seg, scale)
+            phys_prior_upper = to_physical(p_hist_z_seg + prior_std_z, scale)
+            phys_prior_lower = to_physical(p_hist_z_seg - prior_std_z, scale)
 
+            ax_mean.plot(
+                epochs_list,
+                phys_prior_mean,
+                linestyle="--",
+                alpha=0.6,
+                linewidth=1.5,
+                color="black",
+                label="Segment Prior Mean" if segment_idx == 0 else "",
+            )
+            ax_mean.fill_between(
+                epochs_list,
+                phys_prior_lower,
+                phys_prior_upper,
+                color="black",
+                alpha=0.03,  # Reduced alpha so 20 overlapping shades don't block out the plot
+                label="Prior Std Dev" if segment_idx == 0 else "",
+            )
         # Prior Variances
         ax_pvar.plot(epochs_list, prior_std_z**2, color="purple", linewidth=2)
         ax_pvar.set_title(f"Unconstrained Prior Variance: {field}")

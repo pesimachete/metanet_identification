@@ -7,6 +7,7 @@ from .adagrad import (
     adagrad_update,
     adagrad_apply,
     adagrad_apply_stabilised,
+    compute_lr_jax_constant as compute_lr_jax,
 )
 
 
@@ -47,7 +48,8 @@ def log_joint(
 
     # 4. Spatial Prior on z
     var_prior = jnp.exp(theta.prior.log_var)
-    coeff = (var_prior * (1 - theta.prior.corr**2) + 1e-8) ** (-1)
+    corr = jnp.tanh(theta.prior.corr)  # bijector: keeps |corr| < 1 under SGD
+    coeff = (var_prior * (1 - corr**2) + 1e-8) ** (-1)
     e = jnp.stack(
         [
             z.alpha - theta.prior.mean[0],
@@ -58,12 +60,15 @@ def log_joint(
     quad = coeff * (
         e[:, 0] ** 2
         + e[:, -1] ** 2
-        + (1 + theta.prior.corr**2) * jnp.sum(e[:, 1:-1] ** 2, axis=1)
-        - 2 * theta.prior.corr * jnp.sum(e[:, :-1] * e[:, 1:], axis=1)
+        + (1 + corr**2) * jnp.sum(e[:, 1:-1] ** 2, axis=1)
+        - 2 * corr * jnp.sum(e[:, :-1] * e[:, 1:], axis=1)
     )
     lp = -0.5 * jnp.sum(quad)
 
     return ll + lp
+
+
+log_joint_jit = jax.jit(log_joint)
 
 
 @jax.jit
@@ -71,20 +76,23 @@ def pure_update_step(
     state: LearningState,
     z_new: parametanet.ParaNetworkLatentParameters,
     mcmc_var_new: jax.Array,
-    gamma: float,
     k_pre: int,
+    gamma_0: float,
+    alpha_decay: float,
     c_heat: float,
     params_static: parametanet.ParaNetworkStaticParameters,
     scales_scalar: parametanet.ParaNetworkScalarParameters,
     init_net_state: parametanet.NetworkState,
     traj_true: parametanet.SimulationTrajectory,
     boundaries: parametanet.BoundarySequence,
-) -> tuple[LearningState, jax.Array, jax.Array]:
+) -> tuple[LearningState, jax.Array, jax.Array, jax.Array]:
 
     k = state.k
     eps = state.adagrad_eps
+    gamma = compute_lr_jax(
+        k, k_pre, state.k_end_heat, state.heat_ended, gamma_0, alpha_decay
+    )
 
-    # Score calculation via autograd
     score_fn = jax.grad(log_joint)
     g = score_fn(
         state.theta,
@@ -96,7 +104,6 @@ def pure_update_step(
         boundaries,
     )
 
-    # AdaGrad Accumulation & Apply
     adagrad_new = adagrad_update(state.adagrad, g)
     direction = jax.lax.cond(
         k < k_pre,
@@ -106,7 +113,6 @@ def pure_update_step(
     )
     theta_new = jax.tree.map(lambda t, d: t + gamma * d, state.theta, direction)
 
-    # Gradients & EMA
     leaves = jax.tree.leaves(g)
     norm = jnp.sqrt(sum(jnp.sum(l**2) for l in leaves))
     ema_new = state.ema_norm + c_heat * (norm - state.ema_norm)
@@ -119,6 +125,7 @@ def pure_update_step(
         mcmc_variance=mcmc_var_new,
         k=k + 1,
         k_end_heat=state.k_end_heat,
+        heat_ended=state.heat_ended,
         ema_norm=ema_new,
     )
-    return next_state, norm, ema_new
+    return next_state, norm, ema_new, gamma

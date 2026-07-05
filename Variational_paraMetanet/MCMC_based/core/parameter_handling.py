@@ -61,3 +61,13 @@ def map_to_physical_params(
             alpha=alpha_phys, critical_density=rho_cr_phys, free_flow_speed=v_free_phys
         ),
     )
+
+
+def inverse_softplus(y_over_scale: jax.Array, eps: float = 1e-6) -> jax.Array:
+
+    return jnp.log(jnp.expm1(y_over_scale - eps))
+
+
+def to_unconstrained(physical_value: jax.Array, scale, eps: float = 1e-6) -> jax.Array:
+
+    return inverse_softplus(physical_value / scale, eps)

@@ -14,9 +14,10 @@ class LearningState(typing.NamedTuple):
     adagrad: AdaGradState
     adagrad_eps: float
     mcmc_variance: jax.Array
-    k: int
-    k_end_heat: int | None
-    ema_norm: float
+    k: jax.Array  # was: int
+    k_end_heat: jax.Array  # was: int | None -- sentinel, ignored until heat_ended=True
+    heat_ended: jax.Array  # NEW: bool array, replaces "k_end_heat is None"
+    ema_norm: jax.Array
 
 
 class StepDiagnostic(typing.NamedTuple):
@@ -57,12 +58,27 @@ def adagrad_apply_stabilised(
     return jax.tree.map(_blend, state.r, g)
 
 
-def compute_lr(
-    k: int, k_pre: int, k_end_heat: int | None, gamma_0: float, alpha_decay: float
-) -> float:
-    if k < k_pre:
-        return float(gamma_0 ** (1.0 - k / k_pre))
-    elif k_end_heat is None:
-        return 1.0
-    else:
-        return float((k - k_end_heat) ** (-alpha_decay))
+def compute_lr_jax(
+    k: jax.Array,
+    k_pre: int,
+    k_end_heat: jax.Array,
+    heat_ended: jax.Array,
+    gamma_0: float,
+    alpha_decay: float,
+) -> jax.Array:
+    pre_heat = gamma_0 ** (1.0 - k / k_pre)
+    cool = (k - k_end_heat) ** (-alpha_decay)
+    return jnp.where(k < k_pre, pre_heat, jnp.where(heat_ended, cool, 1.0))
+
+
+def compute_lr_jax_constant(
+    k: jax.Array,
+    k_pre: int,
+    k_end_heat: jax.Array,
+    heat_ended: jax.Array,
+    gamma_0: float,
+    alpha_decay: float,
+) -> jax.Array:
+    # Bypass the pre-heat and cooling schedule
+    # Return gamma_0 as a constant learning rate throughout the entire optimization
+    return jnp.asarray(gamma_0, dtype=jnp.float32)
