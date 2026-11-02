@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -51,7 +52,6 @@ def setup_demand_profile(key, K: int, N: int, steps_per_hour: int):
     base_demand = 200 + 100 * jnp.sin(2 * jnp.pi * time_hours / 24 - jnp.pi / 2)
     base_demand = jnp.maximum(base_demand, 50.0)
 
-    # In JAX, we use .at[...].set() instead of in-place mutation
     dem = dem.at[:, major_ramps].set(base_demand[:, None])
 
     # B. Major Ramps: Overloads
@@ -103,96 +103,23 @@ def setup_demand_profile(key, K: int, N: int, steps_per_hour: int):
     return jnp.maximum(dem, 0.0)
 
 
-def generate_noisy_latent_parameters(
-    key: jax.Array, N: int = 20
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """
-    Generates latent traffic parameters with spatial AR(1) noise using a simplified, batched approach.
-    """
-    # 1. Baseline Profiles (Simplified using jnp.where)
-    section_indices = jnp.arange(N)
-    vf_base = jnp.where(section_indices < N // 2, 120.0, 100.0)
-    rho_cr_base = jnp.where(section_indices < N // 2, 32.0, 28.0)
-    alpha_base = jnp.full(N, 1.8)
-
-    # 2. Batched White Noise Generation
-    # Generate all noise simultaneously: Shape (3 parameters, N sections)
-    innovations = jax.random.normal(key, shape=(3, N))
-
-    std_devs = jnp.array([[1.0], [0.2], [0.02]])
-    innovations = innovations * std_devs
-
-    # 3. Simplified AR(1) Spatial Loop
-    # JAX will unroll this loop efficiently during compilation for static N
-    zeta = 0.95
-    noise = jnp.zeros((3, N))
-    noise = noise.at[:, 0].set(innovations[:, 0])
-
-    for i in range(1, N):
-        noise = noise.at[:, i].set(zeta * noise[:, i - 1] + innovations[:, i])
-
-    # 4. Superimpose and Constrain
-    vf_final = jnp.maximum(vf_base + noise[0], 10.0)
-    rho_cr_final = jnp.maximum(rho_cr_base + noise[1], 5.0)
-    alpha_final = jnp.maximum(alpha_base + noise[2], 0.1)
-
-    return vf_final, rho_cr_final, alpha_final
-
-
-def generate_ar1_parameters(
-    key: jax.Array, N: int = 20, zeta: float = 0.95
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """
-    Generates a pure spatial AR(1) process for latent traffic parameters,
-    omitting base deterministic behavior.
-    """
-    # 1. Batched White Noise Generation
-    # Generate all noise simultaneously: Shape (3 parameters, N sections)
-    innovations = jax.random.normal(key, shape=(3, N))
-
-    # Apply standard deviations
-    std_devs = jnp.array([[1.0], [0.2], [0.02]])
-    innovations = innovations * std_devs
-
-    # 2. AR(1) Spatial Loop
-    # JAX will unroll this loop efficiently during compilation for static N
-    noise = jnp.zeros((3, N))
-    noise = noise.at[:, 0].set(innovations[:, 0])
-
-    for i in range(1, N):
-        noise = noise.at[:, i].set(zeta * noise[:, i - 1] + innovations[:, i])
-
-    # 3. Return the pure AR(1) series for each parameter
-    return noise[0] + 120, noise[1] + 32, noise[2] + 1.8
-
-
 def generate_ar1_parameters_unconstrained(
-    key: jax.Array, N: int = 20, zeta: float = 0.95
+    key: jax.Array, N: int = 20, zeta: float = 0.95, var: float = 0.005
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """
-    Generates a spatial AR(1) process directly in the unconstrained space.
-    The base targets (0.84, 3.16, 1.62) map to physical values of 120, 32, and 1.8
-    after undergoing the scaled softplus transformation.
-    """
-    z_vfree_base = 0.84
-    z_rhocr_base = 3.16
-    z_alpha_base = 1.62
 
-    innovations = jax.random.normal(key, shape=(3, N))
+    bases = jnp.array([0.84, 3.16, 1.62])
 
-    std_devs = jnp.array([[0.005], [0.005], [0.005]])
-    innovations = innovations * std_devs
+    fr = zeta ** jnp.arange(N)
+    cov_matrix = (var) * jsp.linalg.toeplitz(fr)
 
-    noise = jnp.zeros((3, N))
-    initial_noise = innovations[:, 0] / jnp.sqrt(1 - zeta**2)
-    noise = noise.at[:, 0].set(initial_noise)
+    mean_matrix = jnp.repeat(bases[:, None], N, axis=1)
 
-    for i in range(1, N):
-        noise = noise.at[:, i].set(zeta * noise[:, i - 1] + innovations[:, i])
+    keys = jax.random.split(key, 3)
+    sample_paths = jax.vmap(jax.random.multivariate_normal, in_axes=(0, 0, None))(
+        keys, mean_matrix, cov_matrix
+    )
 
-    z_vfree = z_vfree_base + noise[0]
-    z_rhocr = z_rhocr_base + noise[1]
-    z_alpha = z_alpha_base + noise[2]
+    z_vfree, z_rhocr, z_alpha = sample_paths[0], sample_paths[1], sample_paths[2]
 
     return z_vfree, z_rhocr, z_alpha
 
@@ -213,17 +140,14 @@ def simulate_example():
     L = jnp.full(N, 0.5)
     lambda_ = jnp.full(N, 1.0)
 
-    # ---------------------------
-    # 2. Corrected Physical Parameters
-    # ---------------------------
     key = jax.random.PRNGKey(42)
 
     # 1. Generate Noisy Parameters
     key, param_key = jax.random.split(key)
     z_vfree, z_rhocr, z_alpha = generate_ar1_parameters_unconstrained(param_key, N)
-    vf_noisy = (jax.nn.softplus(z_vfree) + 1e-6) * 100.0
-    rho_cr_noisy = (jax.nn.softplus(z_rhocr) + 1e-6) * 10.0
-    alpha_noisy = (jax.nn.softplus(z_alpha) + 1e-6) * 1.0
+    vf_noisy = (jax.nn.softplus(z_vfree)) * 100.0
+    rho_cr_noisy = (jax.nn.softplus(z_rhocr)) * 10.0
+    alpha_noisy = (jax.nn.softplus(z_alpha)) * 1.0
 
     tau = 0.08
     nu = 50.0
@@ -280,7 +204,6 @@ def simulate_example():
     # ---------------------------
     # 5. Run Simulation
     # ---------------------------
-    # If metanet.rollout_simulation is written in pure JAX, you can even JIT this call!
     traj = parametanet.rollout_simulation(init_state, boundaries, params)
 
     return traj, params, boundaries, init_state

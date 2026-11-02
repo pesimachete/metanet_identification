@@ -7,3 +7,10 @@ opt/
 tests/
 bad_codes/
 
+*.pkl
+
+figures_*
+
+fisher_identity_ci/
+
+learning_figures_*

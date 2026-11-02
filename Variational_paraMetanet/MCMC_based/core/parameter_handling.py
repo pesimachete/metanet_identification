@@ -32,25 +32,20 @@ def map_to_physical_params(
     unconstrained_scalar: parametanet.ParaNetworkScalarParameters,
     params_static: parametanet.ParaNetworkStaticParameters,
     scales_scalar: parametanet.ParaNetworkScalarParameters,
-    eps: float = 1e-6,
 ) -> parametanet.ParaNetworkParameters:
     """
     Maps unconstrained variables to strictly positive physical constraints using softplus.
     """
     # 1. Map Spatial (Latent) Parameters
-    alpha_phys = (jax.nn.softplus(unconstrained_latent.alpha) + eps) * 1.0
-    rho_cr_phys = (jax.nn.softplus(unconstrained_latent.critical_density) + eps) * 10.0
-    v_free_phys = (jax.nn.softplus(unconstrained_latent.free_flow_speed) + eps) * 100.0
+    alpha_phys = (jax.nn.softplus(unconstrained_latent.alpha)) * 1.0
+    rho_cr_phys = (jax.nn.softplus(unconstrained_latent.critical_density)) * 10.0
+    v_free_phys = (jax.nn.softplus(unconstrained_latent.free_flow_speed)) * 100.0
 
     # 2. Map Global (Scalar) Parameters
-    beta_phys = (jax.nn.softplus(unconstrained_scalar.beta) + eps) * scales_scalar.beta
-    mu_phys = (jax.nn.softplus(unconstrained_scalar.mu) + eps) * scales_scalar.mu
-    kappa_phys = (
-        jax.nn.softplus(unconstrained_scalar.kappa) + eps
-    ) * scales_scalar.kappa
-    gamma_phys = (
-        jax.nn.softplus(unconstrained_scalar.gamma) + eps
-    ) * scales_scalar.gamma
+    beta_phys = (jax.nn.softplus(unconstrained_scalar.beta)) * scales_scalar.beta
+    mu_phys = (jax.nn.softplus(unconstrained_scalar.mu)) * scales_scalar.mu
+    kappa_phys = (jax.nn.softplus(unconstrained_scalar.kappa)) * scales_scalar.kappa
+    gamma_phys = (jax.nn.softplus(unconstrained_scalar.gamma)) * scales_scalar.gamma
 
     return parametanet.ParaNetworkParameters(
         static_params=params_static,
@@ -63,11 +58,11 @@ def map_to_physical_params(
     )
 
 
-def inverse_softplus(y_over_scale: jax.Array, eps: float = 1e-6) -> jax.Array:
+def inverse_softplus(y_over_scale: jax.Array) -> jax.Array:
 
-    return jnp.log(jnp.expm1(y_over_scale - eps))
+    return y_over_scale + jnp.log(-jnp.expm1(-y_over_scale))
 
 
-def to_unconstrained(physical_value: jax.Array, scale, eps: float = 1e-6) -> jax.Array:
+def to_unconstrained(physical_value: jax.Array, scale) -> jax.Array:
 
-    return inverse_softplus(physical_value / scale, eps)
+    return inverse_softplus(physical_value / scale)

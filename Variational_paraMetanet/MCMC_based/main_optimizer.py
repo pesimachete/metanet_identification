@@ -1,20 +1,24 @@
 import os
 import itertools
+import pickle
+from datetime import datetime
 
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
 os.environ["JAX_PLATFORM"] = "cpu"
 
 import jax
 import jax.numpy as jnp
+
+jax.config.update("jax_enable_x64", True)
+
 import numpy as np
 from tqdm import tqdm
 
-# Import the interruptible list (assuming it is at the root or accessible)
 from interruptible_list import interruptible_list
 
 from Variational_paraMetanet.MCMC_based.simulator import parametanet
 from Variational_paraMetanet.MCMC_based.simulator import (
-    parapersistentExitationSimulation as peSim,
+    paraLongHighway as peSim,
 )
 
 from Variational_paraMetanet.MCMC_based.core.parameter_handling import (
@@ -23,16 +27,15 @@ from Variational_paraMetanet.MCMC_based.core.parameter_handling import (
     DataLogVariance,
     to_unconstrained,
 )
-from Variational_paraMetanet.MCMC_based.core.adagrad import (
+from Variational_paraMetanet.MCMC_based.core.adam import (
     LearningState,
-    init_adagrad,
+    init_adam,
 )
 from Variational_paraMetanet.MCMC_based.core.objective import (
     pure_update_step,
     log_joint_jit,
 )
 from Variational_paraMetanet.MCMC_based.sampling.hwg_met import (
-    log_posterior,
     mcmc_advance,
 )
 from Variational_paraMetanet.MCMC_based.utils import visualization
@@ -40,7 +43,7 @@ from Variational_paraMetanet.MCMC_based.utils import visualization
 
 def disturb_measurment(key: jax.Array, measurment: jax.Array):
     """Applies multiplicative noise to the simulation measurements."""
-    ssq = 10e-2  # Adjust based on desired noise level (e.g., 10e-1 for higher noise)
+    ssq = 10e-2
     return jnp.exp(jax.random.normal(key, measurment.shape) * ssq) * measurment
 
 
@@ -58,13 +61,11 @@ def mcmc_draw(
     adapt_beta: float,
 ) -> tuple[parametanet.ParaNetworkLatentParameters, jax.Array]:
 
-    log_post0 = log_posterior(
+    log_post0 = log_joint_jit(
+        state.theta,
         state.z,
-        state.theta.scalar,
-        state.theta.prior,
         params_static,
         scales_scalar,
-        state.theta.obs_var,
         init_net_state,
         traj_true,
         boundaries,
@@ -75,11 +76,9 @@ def mcmc_draw(
         log_post_init=log_post0,
         mcmc_variance=state.mcmc_variance,
         key=key,
-        params_fis=state.theta.scalar,
-        params_lat=state.theta.prior,
+        theta=state.theta,
         params_static=params_static,
         scales_scalar=scales_scalar,
-        data_log_variance=state.theta.obs_var,
         init_state=init_net_state,
         traj_true=traj_true,
         boundaries=boundaries,
@@ -99,15 +98,11 @@ def optimization_generator(
     traj_true: parametanet.SimulationTrajectory,
     boundaries: parametanet.BoundarySequence,
     log_every: int = 10,
-    k_pre: int = 1000,
     gamma_0: float = 1e-4,
-    alpha_decay: float = 2.0 / 3.0,
-    c_heat: float = 1e-3,
-    adagrad_eps: float = 1e-8,
+    adagrad_eps: float = 1e-7,
     num_blocks: int = 4,
     sampler_iters: int = 10,
     adapt_alpha: float = 1.01,
-    patience_epochs: int = 5000,
     mcmc_key: jax.Array = jax.random.PRNGKey(0),
 ):
 
@@ -118,25 +113,18 @@ def optimization_generator(
     state = LearningState(
         theta=theta_init,
         z=theta_init.latent,
-        adagrad=init_adagrad(theta_init),
-        adagrad_eps=adagrad_eps,
+        adam=init_adam(theta_init),
+        adam_eps=adagrad_eps,
         mcmc_variance=jnp.full((3, num_blocks), 0.05),
-        k=jnp.array(0, dtype=jnp.int32),
-        k_end_heat=jnp.array(0, dtype=jnp.int32),
-        heat_ended=jnp.array(False),
-        ema_norm=jnp.array(0.0),
+        k=jnp.array(1, dtype=jnp.int32),
     )
 
     latent_names = ["alpha", "critical_density", "free_flow_speed"]
     scalar_names = ["beta", "mu", "kappa", "gamma"]
 
-    best_norm = float("inf")
-    steps_without_improvement = 0
-
     pbar = tqdm(itertools.count(), desc="Optimizing MCMC-AdaGrad")
 
     for epoch in pbar:
-        k = state.k
         epoch_key = jax.random.fold_in(mcmc_key, epoch)
 
         z_new, mcmc_var_new = mcmc_draw(
@@ -153,14 +141,11 @@ def optimization_generator(
             adapt_beta,
         )
 
-        state, norm_jax, ema_new_jax, gamma_jax = pure_update_step(
+        state, gamma_jax, grad_theta = pure_update_step(
             state,
             z_new,
             mcmc_var_new,
-            k_pre,
             gamma_0,
-            alpha_decay,
-            c_heat,
             params_static,
             scales_scalar,
             init_net_state,
@@ -168,40 +153,10 @@ def optimization_generator(
             boundaries,
         )
 
-        norm = float(norm_jax)
-        ema_new = float(ema_new_jax)
         gamma = float(gamma_jax)
-        k_int = int(k)
+        pbar.set_description(f"Epoch: {epoch} | lr: {gamma:.4e}")
 
-        if k_int >= k_pre and not bool(state.heat_ended):
-            if ema_new > best_norm:
-                state = state._replace(
-                    k_end_heat=jnp.array(k_int, dtype=jnp.int32),
-                    heat_ended=jnp.array(True),
-                )
-                pbar.write(f"[SGD] Heating ended at k={k_int}. Starting cooling phase.")
-            else:
-                best_norm = ema_new
-
-        if bool(state.heat_ended):
-            if ema_new < best_norm:
-                best_norm = ema_new
-                steps_without_improvement = 0
-            else:
-                steps_without_improvement += 1
-
-        phase = (
-            "pre-heat"
-            if k_int < k_pre
-            else ("heat" if not bool(state.heat_ended) else "cool")
-        )
-        pbar.set_description(
-            f"Phase: {phase} | ‖g‖ EMA: {ema_new:.4f} | Wait: {steps_without_improvement}/{patience_epochs}"
-        )
-
-        # Yield exactly the format the visualization logic expects
-        if epoch % log_every == 0 or steps_without_improvement >= patience_epochs:
-            # Calculate Joint Log Likelihood for diagnostic plotting
+        if epoch % log_every == 0:
             current_log_joint = float(
                 log_joint_jit(
                     state.theta,
@@ -217,11 +172,15 @@ def optimization_generator(
             cached_curr_p = {
                 name: np.array(getattr(z_new, name)) for name in latent_names
             }
-
-            # The MCMC optimizer only has MAP point estimates for theta (no variational stds)
             cached_curr_s = {
                 name: np.zeros_like(cached_curr_p[name]) for name in latent_names
             }
+
+            # --- FIX: Append Scalar Parameters to the cache ---
+            for name in scalar_names:
+                cached_curr_p[name] = float(getattr(state.theta.scalar, name))
+                cached_curr_s[name] = 0.0
+            # --------------------------------------------------
 
             cached_curr_pr_p = {
                 name: np.array(state.theta.prior.mean[i])
@@ -235,17 +194,26 @@ def optimization_generator(
                 name: float(jnp.tanh(state.theta.prior.corr)) for name in latent_names
             }
 
+            # --- Cache the gradients ---
+            cached_curr_grads = {
+                name: np.array(getattr(grad_theta.latent, name))
+                for name in latent_names
+            }
+            # Extract scalar gradients
             for field in scalar_names:
-                cached_curr_p[field] = float(getattr(state.theta.scalar, field))
-                cached_curr_s[field] = 0.0
-                cached_curr_pr_p[field] = None
-                cached_curr_pr_s[field] = None
-                cached_curr_pr_corr[field] = None
+                cached_curr_grads[field] = float(getattr(grad_theta.scalar, field))
+
+            # Extract prior and observation variance gradients
+            cached_curr_grads["prior_mean"] = np.array(grad_theta.prior.mean)
+            cached_curr_grads["prior_log_var"] = np.array(grad_theta.prior.log_var)
+            cached_curr_grads["prior_corr"] = float(grad_theta.prior.corr)
+            cached_curr_grads["obs_var_flow"] = float(grad_theta.obs_var.log_var_flow)
+            cached_curr_grads["obs_var_speed"] = float(grad_theta.obs_var.log_var_speed)
 
             yield {
                 "epoch": epoch,
-                "loss": -current_log_joint,  # Negative log joint (to look like a loss curve)
-                "ema_norm": ema_new,
+                "loss": -current_log_joint,
+                "ema_norm": 0.0,
                 "lr": gamma,
                 "params": cached_curr_p,
                 "stds": cached_curr_s,
@@ -254,11 +222,8 @@ def optimization_generator(
                 "prior_corr": cached_curr_pr_corr,
                 "data_var_flow": float(jnp.exp(state.theta.obs_var.log_var_flow)),
                 "data_var_speed": float(jnp.exp(state.theta.obs_var.log_var_speed)),
+                "grads": cached_curr_grads,
             }
-
-        if steps_without_improvement >= patience_epochs:
-            print(f"\nConverged early at epoch {epoch} (EMA Norm: {ema_new:.4f})")
-            break
 
 
 if __name__ == "__main__":
@@ -284,25 +249,18 @@ if __name__ == "__main__":
 
     print("Perturbing parameters for initialization...")
     N = full_p_true.static_params.L.shape[0]
-    key_lat, key_sca = jax.random.split(keys[2])
-
-    # full_p_true.latent_params / scalar_params are PHYSICAL values.
-    # z / theta.latent / theta.scalar live in the unconstrained pre-softplus
-    # space, so the true values must go through the inverse transform BEFORE
-    # noise is added — otherwise softplus(physical) * scale blows up.
+    key_lat, key_sca, key_pri = jax.random.split(keys[2], 3)
     alpha_uncon = to_unconstrained(full_p_true.latent_params.alpha, 1.0)
     rho_cr_uncon = to_unconstrained(full_p_true.latent_params.critical_density, 10.0)
     v_free_uncon = to_unconstrained(full_p_true.latent_params.free_flow_speed, 100.0)
 
-    lat_noise = jax.random.normal(key_lat, (3, N)) * 0.5
+    lat_noise = jax.random.normal(key_lat, (3, N)) * 1e-1
     disturbed_latent = parametanet.ParaNetworkLatentParameters(
         alpha=alpha_uncon + lat_noise[0],
         critical_density=rho_cr_uncon + lat_noise[1],
         free_flow_speed=v_free_uncon + lat_noise[2],
     )
 
-    # scales_scalar == full_p_true.scalar_params, so physical/scale == 1 for
-    # every field at zero noise — this correctly recovers the true value.
     beta_uncon = to_unconstrained(
         full_p_true.scalar_params.beta, full_p_true.scalar_params.beta
     )
@@ -316,22 +274,23 @@ if __name__ == "__main__":
         full_p_true.scalar_params.gamma, full_p_true.scalar_params.gamma
     )
 
-    sca_noise = jax.random.normal(key_sca, (4,)) * 0.5
+    sca_noise = jax.random.normal(key_sca, (4,)) * 1e-2
     disturbed_scalar = parametanet.ParaNetworkScalarParameters(
         beta=beta_uncon + sca_noise[0],
         mu=mu_uncon + sca_noise[1],
-        kappa=kappa_uncon + sca_noise[2],
+        kappa=kappa_uncon,
         gamma=gamma_uncon + sca_noise[3],
     )
 
     # ---------------------------------------------------------
     # INITIALIZATION & EXECUTION
     # ---------------------------------------------------------
+    sca_pri = jax.random.normal(key_pri, (3,)) * 10e-2
     theta_init = Theta(
         latent=disturbed_latent,
         scalar=disturbed_scalar,
         prior=PriorParameters(
-            mean=jnp.array([jnp.full(N, 1.62), jnp.full(N, 3.16), jnp.full(N, 0.84)]),
+            mean=jnp.array([1.62 + sca_pri[0], 3.16 + sca_pri[1], 0.84 + sca_pri[2]]),
             log_var=jnp.log(jnp.array([0.005, 0.005, 0.005])),
             corr=jnp.arctanh(jnp.array(0.95)),
         ),
@@ -340,6 +299,7 @@ if __name__ == "__main__":
             log_var_speed=jnp.log(jnp.array(0.01)),
         ),
     )
+    print("letsgo")
 
     print("Starting MCMC Optimization Loop...")
     results = interruptible_list(
@@ -348,13 +308,12 @@ if __name__ == "__main__":
             params_static=full_p_true.static_params,
             scales_scalar=full_p_true.scalar_params,
             init_net_state=init_net_state,
-            traj_true=trj_dis,  # Use the disturbed trajectory
+            traj_true=trj_dis,
             boundaries=boundaries,
             log_every=5,
-            k_pre=100,
             num_blocks=20,
             sampler_iters=1,
-            patience_epochs=2000,
+            gamma_0=1e-1,
         ),
         save_whole=True,
         callback_whole=lambda res: visualization.print_whole(
@@ -364,3 +323,11 @@ if __name__ == "__main__":
 
     print("Optimization finished. Generating visualizations...")
     visualization.print_whole(results, p_true=full_p_true, block=True)
+    print("Saving optimization results to pickle...")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pickle_filename = f"mcmc_results_{timestamp}.pkl"
+
+    with open(pickle_filename, "wb") as f:
+        pickle.dump(list(results), f)
+
+    print(f"✅ Full results data successfully saved to {pickle_filename}")

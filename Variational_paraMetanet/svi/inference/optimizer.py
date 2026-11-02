@@ -83,8 +83,17 @@ def build_multi_optimizer() -> optax.GradientTransformation:
                     lambda _: "variational", params.variational_posterior.log_var
                 ),
             ),
-            fis_parameters=jax.tree_util.tree_map(
-                lambda _: "fis", params.fis_parameters
+            fis_parameters=parametanet.ParaNetworkScalarParameters(
+                beta=jax.tree_util.tree_map(
+                    lambda _: "fis", params.fis_parameters.beta
+                ),
+                mu=jax.tree_util.tree_map(lambda _: "fis", params.fis_parameters.mu),
+                kappa=jax.tree_util.tree_map(
+                    lambda _: "zero", params.fis_parameters.kappa
+                ),
+                gamma=jax.tree_util.tree_map(
+                    lambda _: "fis", params.fis_parameters.gamma
+                ),
             ),
             prior=parameter_handling.PriorParameters(
                 mean=jax.tree_util.tree_map(lambda _: "prior", params.prior.mean),

@@ -1,9 +1,11 @@
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 import numpy as np
 import matplotlib.pyplot as plt
 
-import parametanet
+
+import Variational_paraMetanet.MCMC_based.simulator.parametanet as parametanet
 
 
 def generate_prbs_jax(
@@ -101,25 +103,22 @@ def generate_noisy_latent_parameters(
 
 
 def generate_ar1_parameters_unconstrained(
-    key: jax.Array, N: int = 100, zeta: float = 0.95
+    key: jax.Array, N: int = 100, zeta: float = 0.95, var: float = 0.005
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    z_vfree_base = 0.84
-    z_rhocr_base = 3.16
-    z_alpha_base = 1.62
 
-    innovations = jax.random.normal(key, shape=(3, N))
-    std_devs = jnp.array([[0.005], [0.005], [0.005]])
-    innovations = innovations * std_devs
+    bases = jnp.array([0.84, 3.16, 1.62])
 
-    noise = jnp.zeros((3, N))
-    noise = noise.at[:, 0].set(innovations[:, 0])
+    fr = zeta ** jnp.arange(N)
+    cov_matrix = (var) * jsp.linalg.toeplitz(fr)
 
-    for i in range(1, N):
-        noise = noise.at[:, i].set(zeta * noise[:, i - 1] + innovations[:, i])
+    mean_matrix = jnp.repeat(bases[:, None], N, axis=1)
 
-    z_vfree = z_vfree_base + noise[0]
-    z_rhocr = z_rhocr_base + noise[1]
-    z_alpha = z_alpha_base + noise[2]
+    keys = jax.random.split(key, 3)
+    sample_paths = jax.vmap(jax.random.multivariate_normal, in_axes=(0, 0, None))(
+        keys, mean_matrix, cov_matrix
+    )
+
+    z_vfree, z_rhocr, z_alpha = sample_paths[0], sample_paths[1], sample_paths[2]
 
     return z_vfree, z_rhocr, z_alpha
 
@@ -138,9 +137,9 @@ def simulate_example():
     key, param_key = jax.random.split(key)
     z_vfree, z_rhocr, z_alpha = generate_ar1_parameters_unconstrained(param_key, N)
 
-    vf_noisy = (jax.nn.softplus(z_vfree) + 1e-6) * 100.0
-    rho_cr_noisy = (jax.nn.softplus(z_rhocr) + 1e-6) * 10.0
-    alpha_noisy = (jax.nn.softplus(z_alpha) + 1e-6) * 1.0
+    vf_noisy = (jax.nn.softplus(z_vfree)) * 100.0
+    rho_cr_noisy = (jax.nn.softplus(z_rhocr)) * 10.0
+    alpha_noisy = (jax.nn.softplus(z_alpha)) * 1.0
 
     physical_params = parametanet.NetworkParameters(
         T=T,
@@ -263,3 +262,6 @@ if __name__ == "__main__":
     print("Density at t=0:", traj.density[0])
 
     plot_trajectories(traj, boundaries.r, boundaries.s, N=100, K=72 * 360)
+    plt.plot(params.latent_params.free_flow_speed, label="Free Flow Speed (vfree)")
+    plt.legend()
+    plt.show()
